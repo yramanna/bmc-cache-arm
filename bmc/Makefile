@@ -53,7 +53,7 @@ LINUXINCLUDE += -I$(LINUX_PATH)/tools/testing/selftests/bpf
 LINUXINCLUDE += -include $(LINUX_PATH)/include/linux/kconfig.h
 LINUXINCLUDE += -include $(LINUX_PATH)/samples/bpf/asm_goto_workaround.h
 
-EXTRA_CFLAGS=-Werror
+EXTRA_CFLAGS=-Werror -Wno-pass-failed
 
 ###
 

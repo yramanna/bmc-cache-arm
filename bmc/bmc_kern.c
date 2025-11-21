@@ -21,13 +21,12 @@
 
 #define ADJUST_HEAD_LEN 128
 
-/* Use builtin for ARM64 - let compiler handle it */
-#ifndef memcpy
-#define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
-#endif
-
 #ifndef memmove
 #define memmove(dest, src, n) __builtin_memmove((dest), (src), (n))
+#endif
+
+#ifndef memcpy
+#define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
 #endif
 
 struct memcached_udp_header {
@@ -95,7 +94,7 @@ struct {
 	__uint(max_entries, BMC_PROG_TC_MAX);
 } map_progs_tc SEC(".maps");
 
-static __always_inline u16 compute_ip_checksum(struct iphdr *ip)
+static inline u16 compute_ip_checksum(struct iphdr *ip)
 {
 	u32 csum = 0;
 	u16 *next_ip_u16 = (u16 *)ip;
@@ -146,8 +145,7 @@ int bmc_rx_filter_main(struct xdp_md *ctx)
 	}
 
 	if (dport == htons(11211) && payload + 4 <= data_end) {
-		if (ip->protocol == IPPROTO_UDP && payload[0] == 'g' && payload[1] == 'e' && 
-		    payload[2] == 't' && payload[3] == ' ') {
+		if (ip->protocol == IPPROTO_UDP && payload[0] == 'g' && payload[1] == 'e' && payload[2] == 't' && payload[3] == ' ') {
 			unsigned int zero = 0;
 			struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
 			if (!stats)
@@ -161,24 +159,13 @@ int bmc_rx_filter_main(struct xdp_md *ctx)
 			pctx->current_key = 0;
 			pctx->write_pkt_offset = 0;
 
-			/* ARM64: Bounded loop with explicit limit */
 			unsigned int off;
-			unsigned int limit = BMC_MAX_PACKET_LENGTH;
-			if ((void *)(payload + limit) > data_end)
-				limit = data_end - (void *)payload;
+#pragma clang loop unroll(disable)
+			for (off = 4; off < BMC_MAX_PACKET_LENGTH && payload + off + 1 <= data_end && payload[off] == ' '; off++) {}
 
-#pragma unroll
-			for (off = 4; off < limit && off < 64; off++) {
-				if (payload + off + 1 > data_end)
-					break;
-				if (payload[off] != ' ')
-					break;
-			}
-
-			if (off < BMC_MAX_PACKET_LENGTH && payload + off <= data_end) {
+			if (off < BMC_MAX_PACKET_LENGTH) {
 				pctx->read_pkt_offset = off;
-				if (bpf_xdp_adjust_head(ctx, (int)(sizeof(*eth) + sizeof(*ip) + 
-				                        sizeof(*udp) + sizeof(struct memcached_udp_header) + off)))
+				if (bpf_xdp_adjust_head(ctx, (int)(sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(struct memcached_udp_header) + off)))
 					return XDP_PASS;
 				bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_HASH_KEYS);
 			}
@@ -210,35 +197,24 @@ int bmc_hash_keys_main(struct xdp_md *ctx)
 		return XDP_PASS;
 	key->hash = FNV_OFFSET_BASIS_32;
 
-	unsigned int done_parsing = 0, key_len = 0;
-	
-	/* ARM64: Strict bounded loop */
-	unsigned int max_off = BMC_MAX_KEY_LENGTH + 1;
-	if ((void *)(payload + max_off) > data_end)
-		max_off = data_end - (void *)payload;
+	unsigned int off, done_parsing = 0, key_len = 0;
 
-#pragma unroll
-	for (unsigned int off = 0; off < max_off && off <= BMC_MAX_KEY_LENGTH; off++) {
-		if (payload + off + 1 > data_end)
-			break;
-		
-		char c = payload[off];
-		if (c == '\r') {
+#pragma clang loop unroll(disable)
+	for (off = 0; off < BMC_MAX_KEY_LENGTH + 1 && payload + off + 1 <= data_end; off++) {
+		if (payload[off] == '\r') {
 			done_parsing = 1;
 			break;
-		} else if (c == ' ') {
+		} else if (payload[off] == ' ') {
 			break;
-		} else {
-			key->hash ^= c;
+		} else if (payload[off] != ' ') {
+			key->hash ^= payload[off];
 			key->hash *= FNV_PRIME_32;
 			key_len++;
 		}
 	}
 
 	if (key_len == 0 || key_len > BMC_MAX_KEY_LENGTH) {
-		bpf_xdp_adjust_head(ctx, 0 - (sizeof(struct ethhdr) + sizeof(struct iphdr) + 
-		                    sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + 
-		                    pctx->read_pkt_offset));
+		bpf_xdp_adjust_head(ctx, 0 - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + pctx->read_pkt_offset));
 		return XDP_PASS;
 	}
 
@@ -250,12 +226,9 @@ int bmc_hash_keys_main(struct xdp_md *ctx)
 	bpf_spin_lock(&entry->lock);
 	if (entry->valid && entry->hash == key->hash) {
 		bpf_spin_unlock(&entry->lock);
-		
-		/* ARM64: Bounded copy with unroll hint */
-#pragma unroll
-		for (unsigned int i = 0; i < BMC_MAX_KEY_LENGTH && i < key_len; i++) {
-			if (payload + i + 1 > data_end)
-				break;
+		unsigned int i = 0;
+#pragma clang loop unroll(disable)
+		for (; i < key_len && payload + i + 1 <= data_end; i++) {
 			key->data[i] = payload[i];
 		}
 		key->len = key_len;
@@ -269,13 +242,11 @@ int bmc_hash_keys_main(struct xdp_md *ctx)
 	}
 
 	if (done_parsing) {
-		bpf_xdp_adjust_head(ctx, 0 - (sizeof(struct ethhdr) + sizeof(struct iphdr) + 
-		                    sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + 
-		                    pctx->read_pkt_offset));
+		bpf_xdp_adjust_head(ctx, 0 - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + pctx->read_pkt_offset));
 		if (pctx->key_count > 0)
 			bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_PREPARE_PACKET);
 	} else {
-		unsigned int off = key_len + 1;
+		off++;
 		pctx->read_pkt_offset += off;
 		if (bpf_xdp_adjust_head(ctx, off))
 			return XDP_PASS;
@@ -357,30 +328,24 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 
 	bpf_spin_lock(&entry->lock);
 	if (entry->valid && key->hash == entry->hash) {
-		/* ARM64: Key comparison with bounds */
-#pragma unroll
+#pragma clang loop unroll(disable)
 		for (int i = 0; i < BMC_MAX_KEY_LENGTH && i < key->len; i++) {
-			if (6 + i >= BMC_MAX_CACHE_DATA_SIZE)
-				break;
 			if (key->data[i] != entry->data[6 + i]) {
 				cache_hit = 0;
-				break;
 			}
 		}
-		
 		if (cache_hit) {
-			/* ARM64: Copy data - use bounded loop */
-			unsigned int copy_len = entry->len;
-			if (copy_len > BMC_MAX_CACHE_DATA_SIZE)
-				copy_len = BMC_MAX_CACHE_DATA_SIZE;
-			
-			/* Byte-by-byte copy for ARM64 safety */
-#pragma unroll
-			for (unsigned int off = 0; off < copy_len && off < BMC_MAX_CACHE_DATA_SIZE; off++) {
-				if (payload + off + 1 > data_end)
-					break;
+			unsigned int off;
+#pragma clang loop unroll(disable)
+			for (off = 0; off + sizeof(unsigned long long) < BMC_MAX_CACHE_DATA_SIZE && off + sizeof(unsigned long long) <= entry->len && payload + off + sizeof(unsigned long long) <= data_end; off++) {
+				*((unsigned long long *)&payload[off]) = *((unsigned long long *)&entry->data[off]);
+				off += sizeof(unsigned long long) - 1;
+				written += sizeof(unsigned long long);
+			}
+#pragma clang loop unroll(disable)
+			for (; off < BMC_MAX_CACHE_DATA_SIZE && off < entry->len && payload + off + 1 <= data_end; off++) {
 				payload[off] = entry->data[off];
-				written++;
+				written += 1;
 			}
 		}
 	}
@@ -389,7 +354,6 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 	struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
 	if (!stats)
 		return XDP_PASS;
-	
 	if (cache_hit)
 		stats->hit_count++;
 	else
@@ -405,9 +369,7 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 			payload[written++] = '\r';
 			payload[written++] = '\n';
 
-			if (bpf_xdp_adjust_head(ctx, 0 - (int)(sizeof(struct ethhdr) + sizeof(struct iphdr) + 
-			                        sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + 
-			                        pctx->write_pkt_offset)))
+			if (bpf_xdp_adjust_head(ctx, 0 - (int)(sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + pctx->write_pkt_offset)))
 				return XDP_DROP;
 
 			void *data_end = (void *)(long)ctx->data_end;
@@ -430,8 +392,7 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 		}
 	} else if (pctx->current_key == pctx->key_count) {
 		stats->hit_misprediction += pctx->key_count;
-		bpf_xdp_adjust_head(ctx, ADJUST_HEAD_LEN - (int)(sizeof(struct ethhdr) + sizeof(struct iphdr) + 
-		                    sizeof(struct udphdr) + sizeof(struct memcached_udp_header)));
+		bpf_xdp_adjust_head(ctx, ADJUST_HEAD_LEN - (int)(sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header)));
 		return XDP_PASS;
 	} else if (pctx->current_key < BMC_MAX_KEY_IN_PACKET) {
 		pctx->write_pkt_offset += written;
@@ -461,26 +422,15 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 	if (!stats)
 		return XDP_PASS;
 
-	u32 hash = 0, cache_idx;
+	u32 hash, cache_idx;
 	int set_found = 0, key_found = 0;
 
-	/* ARM64: Bounded search */
-	unsigned int max_off = BMC_MAX_PACKET_LENGTH;
-	if ((void *)(payload + max_off) > data_end)
-		max_off = data_end - (void *)payload;
-
-#pragma unroll
-	for (unsigned int off = 0; off < max_off && off < 256; off++) {
-		if (payload + off + 1 > data_end)
-			break;
-
-		if (set_found == 0 && payload[off] == 's' && payload + off + 3 <= data_end && 
-		    payload[off + 1] == 'e' && payload[off + 2] == 't') {
+#pragma clang loop unroll(disable)
+	for (unsigned int off = 0; off < BMC_MAX_PACKET_LENGTH && payload + off + 1 <= data_end; off++) {
+		if (set_found == 0 && payload[off] == 's' && payload + off + 3 <= data_end && payload[off + 1] == 'e' && payload[off + 2] == 't') {
 			set_found = 1;
 			off += 3;
 			stats->set_recv_count++;
-			if (off >= max_off || off >= 256)
-				break;
 		} else if (key_found == 0 && set_found == 1 && payload[off] != ' ') {
 			if (payload[off] == '\r') {
 				set_found = 0;
@@ -526,12 +476,11 @@ int bmc_tx_filter_main(struct __sk_buff *skb)
 	char *payload = data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(struct memcached_udp_header);
 	unsigned int zero = 0;
 
-	if (skb->len > BMC_MAX_CACHE_DATA_SIZE + sizeof(struct ethhdr) + sizeof(struct iphdr) + 
-	    sizeof(struct udphdr) + sizeof(struct memcached_udp_header))
+	if (skb->len > BMC_MAX_CACHE_DATA_SIZE + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header))
 		return TC_ACT_OK;
 
 	if (ip + 1 > data_end)
-		return TC_ACT_OK;
+		return XDP_PASS;
 
 	if (ip->protocol != IPPROTO_UDP)
 		return TC_ACT_OK;
@@ -541,12 +490,10 @@ int bmc_tx_filter_main(struct __sk_buff *skb)
 
 	__be16 sport = udp->source;
 
-	if (sport == htons(11211) && payload + 5 + 1 <= data_end && payload[0] == 'V' && 
-	    payload[1] == 'A' && payload[2] == 'L' && payload[3] == 'U' && payload[4] == 'E' && 
-	    payload[5] == ' ') {
+	if (sport == htons(11211) && payload + 5 + 1 <= data_end && payload[0] == 'V' && payload[1] == 'A' && payload[2] == 'L' && payload[3] == 'U' && payload[4] == 'E' && payload[5] == ' ') {
 		struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
 		if (!stats)
-			return TC_ACT_OK;
+			return XDP_PASS;
 		stats->get_resp_count++;
 
 		bpf_tail_call(skb, &map_progs_tc, BMC_PROG_TC_UPDATE_CACHE);
@@ -560,23 +507,13 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 {
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;
-	char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + 
-	                 sizeof(struct udphdr) + sizeof(struct memcached_udp_header));
+	char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header));
 	unsigned int zero = 0;
 
 	u32 hash = FNV_OFFSET_BASIS_32;
 
-	/* ARM64: Bounded hash computation */
-	unsigned int max_off = 6 + BMC_MAX_KEY_LENGTH;
-	if ((void *)(payload + max_off) > data_end)
-		max_off = data_end - (void *)payload;
-
-#pragma unroll
-	for (unsigned int off = 6; off < max_off && off - 6 < BMC_MAX_KEY_LENGTH; off++) {
-		if (payload + off + 1 > data_end)
-			break;
-		if (payload[off] == ' ')
-			break;
+#pragma clang loop unroll(disable)
+	for (unsigned int off = 6; off - 6 < BMC_MAX_KEY_LENGTH && payload + off + 1 <= data_end && payload[off] != ' '; off++) {
 		hash ^= payload[off];
 		hash *= FNV_PRIME_32;
 	}
@@ -589,15 +526,8 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 	bpf_spin_lock(&entry->lock);
 	if (entry->valid && entry->hash == hash) {
 		int diff = 0;
-		
-#pragma unroll
-		for (unsigned int off = 6; off < max_off && off - 6 < BMC_MAX_KEY_LENGTH && off < entry->len; off++) {
-			if (payload + off + 1 > data_end)
-				break;
-			if (off >= BMC_MAX_CACHE_DATA_SIZE)
-				break;
-			if (payload[off] == ' ' && entry->data[off] == ' ')
-				break;
+#pragma clang loop unroll(disable)
+		for (unsigned int off = 6; off - 6 < BMC_MAX_KEY_LENGTH && payload + off + 1 <= data_end && off < entry->len && (payload[off] != ' ' || entry->data[off] != ' '); off++) {
 			if (entry->data[off] != payload[off]) {
 				diff = 1;
 				break;
@@ -611,16 +541,8 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 
 	unsigned int count = 0;
 	entry->len = 0;
-	
-	/* ARM64: Bounded copy */
-	unsigned int copy_max = BMC_MAX_CACHE_DATA_SIZE;
-	if ((void *)(payload + copy_max) > data_end)
-		copy_max = data_end - (void *)payload;
-
-#pragma unroll
-	for (unsigned int j = 0; j < copy_max && j < BMC_MAX_CACHE_DATA_SIZE && count < 2; j++) {
-		if (payload + j + 1 > data_end)
-			break;
+#pragma clang loop unroll(disable)
+	for (unsigned int j = 0; j < BMC_MAX_CACHE_DATA_SIZE && payload + j + 1 <= data_end && count < 2; j++) {
 		entry->data[j] = payload[j];
 		entry->len++;
 		if (payload[j] == '\n')
@@ -633,7 +555,7 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 		bpf_spin_unlock(&entry->lock);
 		struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
 		if (!stats)
-			return TC_ACT_OK;
+			return XDP_PASS;
 		stats->update_count++;
 	} else {
 		bpf_spin_unlock(&entry->lock);
