@@ -7,7 +7,7 @@
  *  GNU Lesser General Public License v2.1 only.
  *
  *  Author: Yoann GHIGOFF <yoann.ghigoff@orange.com> et al.
- *  ARM64 patches for BPF verifier compatibility
+ *  ARM64/BlueField-3 patches for BPF verifier compatibility
  */
 
 #include <linux/bpf.h>
@@ -22,23 +22,23 @@
 #define ADJUST_HEAD_LEN 128
 
 #ifndef memmove
-# define memmove(dest, src, n)  __builtin_memmove((dest), (src), (n))
+#define memmove(dest, src, n) __builtin_memmove((dest), (src), (n))
+#endif
+
+#ifndef memcpy
+#define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
 #endif
 
 struct memcached_udp_header {
-    __be16 request_id;
-    __be16 seq_num;
-    __be16 num_dgram;
-    __be16 unused;
-    char data[];
+	__be16 request_id;
+	__be16 seq_num;
+	__be16 num_dgram;
+	__be16 unused;
+	char data[];
 } __attribute__((__packed__));
 
+/* eBPF maps - BTF style */
 
-/*
- * eBPF maps
-*/
-
-/* cache */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, u32);
@@ -46,8 +46,6 @@ struct {
 	__uint(max_entries, BMC_CACHE_ENTRY_COUNT);
 } map_kcache SEC(".maps");
 
-
-/* keys */
 struct memcached_key {
 	u32 hash;
 	char data[BMC_MAX_KEY_LENGTH];
@@ -61,55 +59,52 @@ struct {
 	__uint(max_entries, BMC_MAX_KEY_IN_PACKET);
 } map_keys SEC(".maps");
 
-/* context */
 struct parsing_context {
 	unsigned int key_count;
 	unsigned int current_key;
 	unsigned short read_pkt_offset;
 	unsigned short write_pkt_offset;
 };
-struct bpf_map_def SEC("maps") map_parsing_context = {
-	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
-	.key_size = sizeof(unsigned int),
-	.value_size = sizeof(struct parsing_context),
-	.max_entries = 1,
-};
 
-/* stats */
-struct bpf_map_def SEC("maps") map_stats = {
-	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
-	.key_size = sizeof(unsigned int),
-	.value_size = sizeof(struct bmc_stats),
-	.max_entries = 1,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, unsigned int);
+	__type(value, struct parsing_context);
+	__uint(max_entries, 1);
+} map_parsing_context SEC(".maps");
 
-/* program maps */
-struct bpf_map_def SEC("maps") map_progs_xdp = {
-	.type = BPF_MAP_TYPE_PROG_ARRAY,
-	.key_size = sizeof(u32),
-	.value_size = sizeof(u32),
-	.max_entries = BMC_PROG_XDP_MAX,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, unsigned int);
+	__type(value, struct bmc_stats);
+	__uint(max_entries, 1);
+} map_stats SEC(".maps");
 
-struct bpf_map_def SEC("maps") map_progs_tc = {
-	.type = BPF_MAP_TYPE_PROG_ARRAY,
-	.key_size = sizeof(u32),
-	.value_size = sizeof(u32),
-	.max_entries = BMC_PROG_TC_MAX,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, BMC_PROG_XDP_MAX);
+} map_progs_xdp SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, BMC_PROG_TC_MAX);
+} map_progs_tc SEC(".maps");
 
 static inline u16 compute_ip_checksum(struct iphdr *ip)
 {
-    u32 csum = 0;
-    u16 *next_ip_u16 = (u16 *)ip;
+	u32 csum = 0;
+	u16 *next_ip_u16 = (u16 *)ip;
 
-    ip->check = 0;
+	ip->check = 0;
 
 #pragma clang loop unroll(full)
-    for (int i = 0; i < (sizeof(*ip) >> 1); i++) {
-        csum += *next_ip_u16++;
-    }
+	for (int i = 0; i < (sizeof(*ip) >> 1); i++) {
+		csum += *next_ip_u16++;
+	}
 
 	return ~((csum & 0xffff) + (csum >> 16));
 }
@@ -131,75 +126,50 @@ int bmc_rx_filter_main(struct xdp_md *ctx)
 		return XDP_PASS;
 
 	switch (ip->protocol) {
-		case IPPROTO_UDP:
-			udp = (struct udphdr *) transp;
-			if (udp + 1 > data_end)
-				return XDP_PASS;
-			dport = udp->dest;
-			payload = transp + sizeof(*udp) + sizeof(struct memcached_udp_header);
-			break;
-		case IPPROTO_TCP:
-			tcp = (struct tcphdr *) transp;
-			if (tcp + 1 > data_end)
-				return XDP_PASS;
-			dport = tcp->dest;
-			payload = transp + sizeof(*tcp);
-			break;
-		default:
+	case IPPROTO_UDP:
+		udp = (struct udphdr *)transp;
+		if (udp + 1 > data_end)
 			return XDP_PASS;
+		dport = udp->dest;
+		payload = transp + sizeof(*udp) + sizeof(struct memcached_udp_header);
+		break;
+	case IPPROTO_TCP:
+		tcp = (struct tcphdr *)transp;
+		if (tcp + 1 > data_end)
+			return XDP_PASS;
+		dport = tcp->dest;
+		payload = transp + sizeof(*tcp);
+		break;
+	default:
+		return XDP_PASS;
 	}
 
-	if (dport == htons(11211) && payload+4 <= data_end) {
-
+	if (dport == htons(11211) && payload + 4 <= data_end) {
 		if (ip->protocol == IPPROTO_UDP && payload[0] == 'g' && payload[1] == 'e' && payload[2] == 't' && payload[3] == ' ') {
 			unsigned int zero = 0;
 			struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
-			if (!stats) {
+			if (!stats)
 				return XDP_PASS;
-			}
 			stats->get_recv_count++;
 
 			struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &zero);
-			if (!pctx) {
+			if (!pctx)
 				return XDP_PASS;
-			}
 			pctx->key_count = 0;
 			pctx->current_key = 0;
 			pctx->write_pkt_offset = 0;
 
-			// ARM64 fix: Manual unroll instead of loop for skipping spaces
-			unsigned int off = 4;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
-			if (payload + off + 1 <= data_end && payload[off] == ' ') off++;
+			unsigned int off;
+#pragma clang loop unroll(disable)
+			for (off = 4; off < BMC_MAX_PACKET_LENGTH && payload + off + 1 <= data_end && payload[off] == ' '; off++) {}
 
-			if (off < BMC_MAX_PACKET_LENGTH && payload + off <= data_end) {
+			if (off < BMC_MAX_PACKET_LENGTH) {
 				pctx->read_pkt_offset = off;
-				
-				int adjust_len = (int)(sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + 
-									   sizeof(struct memcached_udp_header) + off);
-				
-				if (bpf_xdp_adjust_head(ctx, adjust_len)) {
+				if (bpf_xdp_adjust_head(ctx, (int)(sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(struct memcached_udp_header) + off)))
 					return XDP_PASS;
-				}
-				
-				// ARM64 fix: Re-validate data pointers after adjust_head
-				void *data_end_new = (void *)(long)ctx->data_end;
-				void *data_new = (void *)(long)ctx->data;
-
-				if (data_new + 1 > data_end_new) {
-					return XDP_PASS;
-				}
-				
 				bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_HASH_KEYS);
 			}
-		}
-		else if (ip->protocol == IPPROTO_TCP) {
+		} else if (ip->protocol == IPPROTO_TCP) {
 			bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_INVALIDATE_CACHE);
 		}
 	}
@@ -207,58 +177,40 @@ int bmc_rx_filter_main(struct xdp_md *ctx)
 	return XDP_PASS;
 }
 
-
 SEC("bmc_hash_keys")
 int bmc_hash_keys_main(struct xdp_md *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
-	char *payload = (char *) data;
+	char *payload = (char *)data;
 	unsigned int zero = 0;
 
-	// ARM64 fix: Explicit bounds check
-	if (payload + 1 > data_end)
+	if (payload >= data_end)
 		return XDP_PASS;
 
 	struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &zero);
-	if (!pctx) {
+	if (!pctx)
 		return XDP_PASS;
-	}
 
 	struct memcached_key *key = bpf_map_lookup_elem(&map_keys, &pctx->key_count);
-	if (!key) {
+	if (!key)
 		return XDP_PASS;
-	}
 	key->hash = FNV_OFFSET_BASIS_32;
 
-	unsigned int off = 0, done_parsing = 0, key_len = 0;
+	unsigned int off, done_parsing = 0, key_len = 0;
 
-	// ARM64 fix: Explicit bounds check pattern for each iteration
 #pragma clang loop unroll(disable)
-	for (off = 0; off <= BMC_MAX_KEY_LENGTH; off++) {
-		// Check bounds BEFORE creating pointer
-		char *pkt_ptr = payload + off;
-		if (pkt_ptr + 1 > data_end)
-			break;
-		
-		char c = *pkt_ptr;
-		
-		if (c == '\r') {
+	for (off = 0; off < BMC_MAX_KEY_LENGTH + 1 && payload + off + 1 <= data_end; off++) {
+		if (payload[off] == '\r') {
 			done_parsing = 1;
 			break;
-		}
-		if (c == ' ') {
+		} else if (payload[off] == ' ') {
 			break;
+		} else if (payload[off] != ' ') {
+			key->hash ^= payload[off];
+			key->hash *= FNV_PRIME_32;
+			key_len++;
 		}
-		
-		// Hash the character
-		key->hash ^= c;
-		key->hash *= FNV_PRIME_32;
-		key_len++;
-		
-		// Additional bound check
-		if (off >= BMC_MAX_KEY_LENGTH)
-			break;
 	}
 
 	if (key_len == 0 || key_len > BMC_MAX_KEY_LENGTH) {
@@ -268,49 +220,31 @@ int bmc_hash_keys_main(struct xdp_md *ctx)
 
 	u32 cache_idx = key->hash % BMC_CACHE_ENTRY_COUNT;
 	struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
-	if (!entry) {
+	if (!entry)
 		return XDP_PASS;
-	}
 
 	bpf_spin_lock(&entry->lock);
-	int is_valid = entry->valid;
-	int hash_match = (entry->hash == key->hash);
-	bpf_spin_unlock(&entry->lock);
-	
-	if (is_valid && hash_match) {
-		// ARM64 fix: Simplified copy with reduced bounds
-		key->len = 0;
-		
-		// Limit copy to BMC_MAX_KEY_LENGTH (now 64 for ARM64 compatibility)
-		unsigned int copy_len = (key_len <= BMC_MAX_KEY_LENGTH) ? key_len : BMC_MAX_KEY_LENGTH;
-		
+	if (entry->valid && entry->hash == key->hash) {
+		bpf_spin_unlock(&entry->lock);
+		unsigned int i = 0;
 #pragma clang loop unroll(disable)
-		for (unsigned int i = 0; i < BMC_MAX_KEY_LENGTH; i++) {
-			if (i >= copy_len)
-				break;
-			// Direct bounds check without pointer arithmetic
-			void *check_ptr = (void *)(payload + i);
-			if (check_ptr >= data_end)
-				break;
+		for (; i < key_len && payload + i + 1 <= data_end; i++) {
 			key->data[i] = payload[i];
-			key->len++;
 		}
-		
-		if (key->len > 0) {
-			pctx->key_count++;
-		}
+		key->len = key_len;
+		pctx->key_count++;
 	} else {
+		bpf_spin_unlock(&entry->lock);
 		struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
-		if (stats) {
-			stats->miss_count++;
-		}
+		if (!stats)
+			return XDP_PASS;
+		stats->miss_count++;
 	}
 
 	if (done_parsing) {
 		bpf_xdp_adjust_head(ctx, 0 - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + pctx->read_pkt_offset));
-		if (pctx->key_count > 0) {
+		if (pctx->key_count > 0)
 			bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_PREPARE_PACKET);
-		}
 	} else {
 		off++;
 		pctx->read_pkt_offset += off;
@@ -334,11 +268,11 @@ int bmc_prepare_packet_main(struct xdp_md *ctx)
 	struct iphdr *ip = data + sizeof(*eth);
 	struct udphdr *udp = data + sizeof(*eth) + sizeof(*ip);
 	struct memcached_udp_header *memcached_udp_hdr = data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp);
-	char *payload = (char *) (memcached_udp_hdr + 1);
+	char *payload = (char *)(memcached_udp_hdr + 1);
 	void *old_data = data + ADJUST_HEAD_LEN;
-	char *old_payload = (char *) (old_data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(*memcached_udp_hdr));
+	char *old_payload = (char *)(old_data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(*memcached_udp_hdr));
 
-	if (payload >= data_end || old_payload+1 >= data_end)
+	if (payload >= data_end || old_payload + 1 >= data_end)
 		return XDP_PASS;
 
 	memmove(eth, old_data, sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(*memcached_udp_hdr));
@@ -372,47 +306,44 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
-	char *payload = (char *) data;
+	char *payload = (char *)data;
 	unsigned int zero = 0;
 
 	if (payload >= data_end)
 		return XDP_PASS;
 
 	struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &zero);
-	if (!pctx) {
+	if (!pctx)
 		return XDP_PASS;
-	}
 
 	struct memcached_key *key = bpf_map_lookup_elem(&map_keys, &pctx->current_key);
-	if (!key) {
+	if (!key)
 		return XDP_PASS;
-	}
 
 	unsigned int cache_hit = 1, written = 0;
 	u32 cache_idx = key->hash % BMC_CACHE_ENTRY_COUNT;
 	struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
-	if (!entry) {
+	if (!entry)
 		return XDP_DROP;
-	}
 
 	bpf_spin_lock(&entry->lock);
 	if (entry->valid && key->hash == entry->hash) {
 #pragma clang loop unroll(disable)
 		for (int i = 0; i < BMC_MAX_KEY_LENGTH && i < key->len; i++) {
-			if (key->data[i] != entry->data[6+i]) {
+			if (key->data[i] != entry->data[6 + i]) {
 				cache_hit = 0;
 			}
 		}
 		if (cache_hit) {
 			unsigned int off;
 #pragma clang loop unroll(disable)
-			for (off = 0; off+sizeof(unsigned long long) < BMC_MAX_CACHE_DATA_SIZE && off+sizeof(unsigned long long) <= entry->len && payload+off+sizeof(unsigned long long) <= data_end; off++) {
-				*((unsigned long long *) &payload[off]) = *((unsigned long long *) &entry->data[off]);
-				off += sizeof(unsigned long long)-1;
+			for (off = 0; off + sizeof(unsigned long long) < BMC_MAX_CACHE_DATA_SIZE && off + sizeof(unsigned long long) <= entry->len && payload + off + sizeof(unsigned long long) <= data_end; off++) {
+				*((unsigned long long *)&payload[off]) = *((unsigned long long *)&entry->data[off]);
+				off += sizeof(unsigned long long) - 1;
 				written += sizeof(unsigned long long);
 			}
 #pragma clang loop unroll(disable)
-			for (; off < BMC_MAX_CACHE_DATA_SIZE && off < entry->len && payload+off+1 <= data_end; off++) {
+			for (; off < BMC_MAX_CACHE_DATA_SIZE && off < entry->len && payload + off + 1 <= data_end; off++) {
 				payload[off] = entry->data[off];
 				written += 1;
 			}
@@ -421,29 +352,25 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 	bpf_spin_unlock(&entry->lock);
 
 	struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
-	if (!stats) {
+	if (!stats)
 		return XDP_PASS;
-	}
-	if (cache_hit) {
+	if (cache_hit)
 		stats->hit_count++;
-	} else {
+	else
 		stats->miss_count++;
-	}
 
 	pctx->current_key++;
 
 	if (pctx->current_key == pctx->key_count && (pctx->write_pkt_offset > 0 || written > 0)) {
-		if (payload+written+5 <= data_end) {
+		if (payload + written + 5 <= data_end) {
 			payload[written++] = 'E';
 			payload[written++] = 'N';
 			payload[written++] = 'D';
 			payload[written++] = '\r';
 			payload[written++] = '\n';
 
-			if (bpf_xdp_adjust_head(ctx, 0 - (int) (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)
-													+ sizeof(struct memcached_udp_header) + pctx->write_pkt_offset))) {
+			if (bpf_xdp_adjust_head(ctx, 0 - (int)(sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + pctx->write_pkt_offset)))
 				return XDP_DROP;
-			}
 
 			void *data_end = (void *)(long)ctx->data_end;
 			void *data = (void *)(long)ctx->data;
@@ -454,18 +381,18 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 			if (udp + 1 > data_end)
 				return XDP_PASS;
 
-			ip->tot_len = htons((payload+pctx->write_pkt_offset+written) - (char*)ip);
+			ip->tot_len = htons((payload + pctx->write_pkt_offset + written) - (char *)ip);
 			ip->check = compute_ip_checksum(ip);
 			udp->check = 0;
-			udp->len = htons((payload+pctx->write_pkt_offset+written) - (char*)udp);
+			udp->len = htons((payload + pctx->write_pkt_offset + written) - (char *)udp);
 
-			bpf_xdp_adjust_tail(ctx, 0 - (int) ((long) data_end - (long) (payload+pctx->write_pkt_offset+written)));
+			bpf_xdp_adjust_tail(ctx, 0 - (int)((long)data_end - (long)(payload + pctx->write_pkt_offset + written)));
 
 			return XDP_TX;
 		}
 	} else if (pctx->current_key == pctx->key_count) {
 		stats->hit_misprediction += pctx->key_count;
-		bpf_xdp_adjust_head(ctx, ADJUST_HEAD_LEN - (int) (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header)));
+		bpf_xdp_adjust_head(ctx, ADJUST_HEAD_LEN - (int)(sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header)));
 		return XDP_PASS;
 	} else if (pctx->current_key < BMC_MAX_KEY_IN_PACKET) {
 		pctx->write_pkt_offset += written;
@@ -485,29 +412,26 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 	struct ethhdr *eth = data;
 	struct iphdr *ip = data + sizeof(*eth);
 	struct tcphdr *tcp = data + sizeof(*eth) + sizeof(*ip);
-	char *payload = (char *) (tcp + 1);
+	char *payload = (char *)(tcp + 1);
 	unsigned int zero = 0;
 
 	if (payload >= data_end)
 		return XDP_PASS;
 
 	struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
-	if (!stats) {
+	if (!stats)
 		return XDP_PASS;
-	}
 
-	u32 hash;
+	u32 hash, cache_idx;
 	int set_found = 0, key_found = 0;
 
 #pragma clang loop unroll(disable)
-	for (unsigned int off = 0; off < BMC_MAX_PACKET_LENGTH && payload+off+1 <= data_end; off++) {
-
-		if (set_found == 0 && payload[off] == 's' && payload+off+3 <= data_end && payload[off+1] == 'e' && payload[off+2] == 't') {
+	for (unsigned int off = 0; off < BMC_MAX_PACKET_LENGTH && payload + off + 1 <= data_end; off++) {
+		if (set_found == 0 && payload[off] == 's' && payload + off + 3 <= data_end && payload[off + 1] == 'e' && payload[off + 2] == 't') {
 			set_found = 1;
 			off += 3;
 			stats->set_recv_count++;
-		}
-		else if (key_found == 0 && set_found == 1 && payload[off] != ' ') {
+		} else if (key_found == 0 && set_found == 1 && payload[off] != ' ') {
 			if (payload[off] == '\r') {
 				set_found = 0;
 				key_found = 0;
@@ -517,14 +441,12 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 				hash *= FNV_PRIME_32;
 				key_found = 1;
 			}
-		}
-		else if (key_found == 1) {
+		} else if (key_found == 1) {
 			if (payload[off] == ' ') {
-				u32 cache_idx = hash % BMC_CACHE_ENTRY_COUNT;
+				cache_idx = hash % BMC_CACHE_ENTRY_COUNT;
 				struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
-				if (!entry) {
+				if (!entry)
 					return XDP_PASS;
-				}
 				bpf_spin_lock(&entry->lock);
 				if (entry->valid) {
 					entry->valid = 0;
@@ -533,8 +455,7 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 				bpf_spin_unlock(&entry->lock);
 				set_found = 0;
 				key_found = 0;
-			}
-			else {
+			} else {
 				hash ^= payload[off];
 				hash *= FNV_PRIME_32;
 			}
@@ -548,7 +469,7 @@ SEC("bmc_tx_filter")
 int bmc_tx_filter_main(struct __sk_buff *skb)
 {
 	void *data_end = (void *)(long)skb->data_end;
-	void *data     = (void *)(long)skb->data;
+	void *data = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
 	struct iphdr *ip = data + sizeof(*eth);
 	struct udphdr *udp = data + sizeof(*eth) + sizeof(*ip);
@@ -569,13 +490,10 @@ int bmc_tx_filter_main(struct __sk_buff *skb)
 
 	__be16 sport = udp->source;
 
-	if (sport == htons(11211) && payload+5+1 <= data_end && payload[0] == 'V' && payload[1] == 'A' && payload[2] == 'L'
-		&& payload[3] == 'U' && payload[4] == 'E' && payload[5] == ' ') {
-
+	if (sport == htons(11211) && payload + 5 + 1 <= data_end && payload[0] == 'V' && payload[1] == 'A' && payload[2] == 'L' && payload[3] == 'U' && payload[4] == 'E' && payload[5] == ' ') {
 		struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
-		if (!stats) {
+		if (!stats)
 			return XDP_PASS;
-		}
 		stats->get_resp_count++;
 
 		bpf_tail_call(skb, &map_progs_tc, BMC_PROG_TC_UPDATE_CACHE);
@@ -595,22 +513,21 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 	u32 hash = FNV_OFFSET_BASIS_32;
 
 #pragma clang loop unroll(disable)
-	for (unsigned int off = 6; off-6 < BMC_MAX_KEY_LENGTH && payload+off+1 <= data_end && payload[off] != ' '; off++) {
+	for (unsigned int off = 6; off - 6 < BMC_MAX_KEY_LENGTH && payload + off + 1 <= data_end && payload[off] != ' '; off++) {
 		hash ^= payload[off];
 		hash *= FNV_PRIME_32;
 	}
 
 	u32 cache_idx = hash % BMC_CACHE_ENTRY_COUNT;
 	struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
-	if (!entry) {
+	if (!entry)
 		return TC_ACT_OK;
-	}
 
 	bpf_spin_lock(&entry->lock);
 	if (entry->valid && entry->hash == hash) {
 		int diff = 0;
 #pragma clang loop unroll(disable)
-		for (unsigned int off = 6; off-6 < BMC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < entry->len && (payload[off] != ' ' || entry->data[off] != ' '); off++) {
+		for (unsigned int off = 6; off - 6 < BMC_MAX_KEY_LENGTH && payload + off + 1 <= data_end && off < entry->len && (payload[off] != ' ' || entry->data[off] != ' '); off++) {
 			if (entry->data[off] != payload[off]) {
 				diff = 1;
 				break;
@@ -625,7 +542,7 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 	unsigned int count = 0;
 	entry->len = 0;
 #pragma clang loop unroll(disable)
-	for (unsigned int j = 0; j < BMC_MAX_CACHE_DATA_SIZE && payload+j+1 <= data_end && count < 2; j++) {
+	for (unsigned int j = 0; j < BMC_MAX_CACHE_DATA_SIZE && payload + j + 1 <= data_end && count < 2; j++) {
 		entry->data[j] = payload[j];
 		entry->len++;
 		if (payload[j] == '\n')
@@ -637,9 +554,8 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 		entry->hash = hash;
 		bpf_spin_unlock(&entry->lock);
 		struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
-		if (!stats) {
+		if (!stats)
 			return XDP_PASS;
-		}
 		stats->update_count++;
 	} else {
 		bpf_spin_unlock(&entry->lock);
@@ -647,3 +563,5 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 
 	return TC_ACT_OK;
 }
+
+char _license[] SEC("license") = "GPL";
