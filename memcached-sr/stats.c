@@ -200,6 +200,7 @@ char *stats_prefix_dump(int *length) {
             total_written += written;
             assert(total_written < size);
         }
+    (void)total_written; /* Used in assert */
     }
 
     STATS_UNLOCK();
